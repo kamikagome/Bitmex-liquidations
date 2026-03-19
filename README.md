@@ -10,6 +10,12 @@ A real-time liquidation monitoring dashboard built with Streamlit and the BitMEX
 
 ---
 
+## Live Demo
+
+**View live:** https://bitmex-liquidations-dash.streamlit.app/
+
+---
+
 ## What it does
 
 Streams live liquidation events from BitMEX via WebSocket and visualizes them in a Streamlit dashboard that auto-refreshes every 1.5 seconds.
