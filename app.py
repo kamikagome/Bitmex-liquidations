@@ -1,13 +1,27 @@
 """BitMEX Real-Time Liquidation Dashboard."""
 
-import streamlit as st
-from streamlit_autorefresh import st_autorefresh
-from queue import Queue
+import logging
+import queue
 from datetime import datetime, timezone
+from queue import Queue
+
 import pandas as pd
 import plotly.express as px
+import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from ws_client import start_ws_thread
+
+# --- Constants ---
+REFRESH_INTERVAL_MS: int = 1500
+MAX_EVENTS: int = 5000
+FEED_DISPLAY_ROWS: int = 100
+COLORS: dict[str, str] = {"Buy": "#26a69a", "Sell": "#ef5350"}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 # --- Page config ---
 st.set_page_config(
@@ -17,7 +31,7 @@ st.set_page_config(
 )
 
 # --- Auto-refresh every 1.5s ---
-st_autorefresh(interval=1500, key="data_refresh")
+st_autorefresh(interval=REFRESH_INTERVAL_MS, key="data_refresh")
 
 # --- Session state init (once per tab) ---
 if "initialized" not in st.session_state:
@@ -30,30 +44,42 @@ if "initialized" not in st.session_state:
     )
 
 
-# --- Drain queue ---
-def drain_queue():
-    q = st.session_state.queue
-    new_events = []
+def drain_queue() -> None:
+    """Drain all pending liquidation events from the WS thread queue into session state.
+
+    Caps the event buffer at MAX_EVENTS to bound memory usage. Safe to call
+    on every Streamlit rerun because Queue.get_nowait() is thread-safe.
+    """
+    q: Queue = st.session_state.queue
+    new_events: list[dict] = []
     while not q.empty():
         try:
             new_events.append(q.get_nowait())
-        except Exception:
+        except queue.Empty:
             break
     if new_events:
         st.session_state.liq_events.extend(new_events)
-        if len(st.session_state.liq_events) > 5000:
-            st.session_state.liq_events = st.session_state.liq_events[-5000:]
+        if len(st.session_state.liq_events) > MAX_EVENTS:
+            st.session_state.liq_events = st.session_state.liq_events[-MAX_EVENTS:]
 
 
 drain_queue()
 
 
-# --- USD value calculation ---
-def calc_usd_value(row):
-    """Inverse contracts (XBTUSD): leavesQty IS USD. Linear (USDT): qty * price."""
+def calc_usd_value(row: pd.Series) -> float:
+    """Return the USD notional value of a liquidation event.
+
+    BitMEX inverse contracts (symbols ending in 'USD' but not 'USDT') are
+    denominated such that leavesQty is already the USD amount (1 contract = $1).
+    Linear/quanto contracts (USDT pairs) require leavesQty * price for USD notional.
+
+    Note: relies on BitMEX naming convention where inverse contracts end in 'USD'.
+    Symbols outside this pattern (e.g. hypothetical inverse EUR contracts) would
+    be misclassified as linear.
+    """
     if row["symbol"].endswith("USD") and "USDT" not in row["symbol"]:
-        return row["leavesQty"]
-    return row["leavesQty"] * row["price"]
+        return float(row["leavesQty"])
+    return float(row["leavesQty"] * row["price"])
 
 
 # --- Build DataFrame ---
@@ -61,9 +87,6 @@ df = pd.DataFrame(st.session_state.liq_events)
 if not df.empty:
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df["usd_value"] = df.apply(calc_usd_value, axis=1)
-
-# --- Color map ---
-COLORS = {"Buy": "#26a69a", "Sell": "#ef5350"}
 
 # --- Sidebar ---
 with st.sidebar:
@@ -127,7 +150,9 @@ if df.empty:
 st.subheader("Live Liquidation Feed")
 display_df = (
     df.sort_values("timestamp", ascending=False)
-    .head(100)[["timestamp", "symbol", "side", "price", "leavesQty", "usd_value"]]
+    .head(FEED_DISPLAY_ROWS)[
+        ["timestamp", "symbol", "side", "price", "leavesQty", "usd_value"]
+    ]
 )
 st.dataframe(display_df, use_container_width=True, height=300)
 
@@ -139,7 +164,7 @@ with chart_col1:
     symbols = sorted(df["symbol"].unique().tolist())
     selected_symbol = st.selectbox("Symbol", symbols, index=0, key="hist_symbol")
     df_sym = df[df["symbol"] == selected_symbol]
-    fig = px.histogram(
+    fig_price_hist = px.histogram(
         df_sym,
         x="price",
         weights="leavesQty",
@@ -148,13 +173,13 @@ with chart_col1:
         color_discrete_map=COLORS,
         labels={"price": "Price", "leavesQty": "Volume"},
     )
-    fig.update_layout(barmode="stack", height=370)
-    st.plotly_chart(fig, use_container_width=True)
+    fig_price_hist.update_layout(barmode="stack", height=370)
+    st.plotly_chart(fig_price_hist, use_container_width=True)
 
 with chart_col2:
     st.subheader("Cumulative Volume by Side")
     side_agg = df.groupby("side")["usd_value"].sum().reset_index()
-    fig = px.bar(
+    fig_side_bar = px.bar(
         side_agg,
         x="side",
         y="usd_value",
@@ -162,15 +187,15 @@ with chart_col2:
         color_discrete_map=COLORS,
         labels={"usd_value": "USD Value", "side": "Side"},
     )
-    fig.update_layout(height=400, showlegend=False)
-    st.plotly_chart(fig, use_container_width=True)
+    fig_side_bar.update_layout(height=400, showlegend=False)
+    st.plotly_chart(fig_side_bar, use_container_width=True)
 
 # --- Charts row 2 ---
 st.subheader("Liquidation Volume Over Time (1-min buckets)")
 df_timeline = df.copy()
 df_timeline["minute"] = df_timeline["timestamp"].dt.floor("1min")
 timeline = df_timeline.groupby(["minute", "side"])["usd_value"].sum().reset_index()
-fig = px.bar(
+fig_timeline = px.bar(
     timeline,
     x="minute",
     y="usd_value",
@@ -179,8 +204,8 @@ fig = px.bar(
     labels={"minute": "Time", "usd_value": "USD Value"},
     barmode="stack",
 )
-fig.update_layout(height=350)
-st.plotly_chart(fig, use_container_width=True)
+fig_timeline.update_layout(height=350)
+st.plotly_chart(fig_timeline, use_container_width=True)
 
 # --- Charts row 3 ---
 st.subheader("Top Symbols by Liquidation Volume")
@@ -191,7 +216,7 @@ symbol_agg = (
     .sort_values("usd_value", ascending=False)
     .head(10)
 )
-fig = px.bar(
+fig_symbols = px.bar(
     symbol_agg,
     x="symbol",
     y="usd_value",
@@ -199,5 +224,5 @@ fig = px.bar(
     color_continuous_scale="Reds",
     labels={"symbol": "Symbol", "usd_value": "USD Value"},
 )
-fig.update_layout(height=350)
-st.plotly_chart(fig, use_container_width=True)
+fig_symbols.update_layout(height=350)
+st.plotly_chart(fig_symbols, use_container_width=True)
